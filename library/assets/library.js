@@ -168,4 +168,181 @@
       });
     }
   }
+  /* band spectrum charts: zoom / pan and the licence-class filter. Progressive enhancement over the static inline
+     SVG (the same maths as src/lib/chart.ts); without JavaScript the chart stays at full width and the controls
+     stay hidden. Every number comes from the data-* attributes the generator wrote from the YAML. */
+  var SVGNS = "http://www.w3.org/2000/svg";
+  function niceStep(raw) {
+    var base = Math.pow(10, Math.floor(Math.log10(raw))), f = raw / base;
+    var nice = f <= 1 ? 1 : f <= 2 ? 2 : f <= 5 ? 5 : 10;
+    return Math.max(1, Math.round(nice * base));
+  }
+  function genTicks(d, target) {
+    var step = niceStep((d.end - d.start) / target), out = [];
+    for (var v = Math.ceil(d.start / step) * step; v <= d.end; v += step) out.push(Math.round(v));
+    return out.length ? out : [d.start];
+  }
+  var EXP = { Hz: 0, kHz: 3, MHz: 6, GHz: 9 };
+  /* exact decimal text of an integer Hz value in a unit (no rounding); minDec is a floor, as in site_bandplan.py */
+  function fmtHz(hz, unit, minDec) {
+    var e = EXP[unit], div = Math.pow(10, e), ip = Math.floor(hz / div), rem = hz - ip * div;
+    var frac = e ? String(rem) : "";
+    while (frac.length < e) frac = "0" + frac;
+    var floor = Math.min(minDec, e), end = frac.length;
+    while (end > floor && frac.charAt(end - 1) === "0") end--;
+    frac = frac.slice(0, end);
+    while (frac.length < minDec) frac += "0";
+    return frac ? ip + "." + frac : String(ip);
+  }
+  function clampDomain(d, bounds, minSpan) {
+    var s = d.start, e = d.end;
+    if (e - s < minSpan) { var m = (s + e) / 2; s = m - minSpan / 2; e = m + minSpan / 2; }
+    var bs = bounds.end - bounds.start, cs = Math.min(e - s, bs);
+    if (e - s !== cs) { var m2 = (s + e) / 2; s = m2 - cs / 2; e = m2 + cs / 2; }
+    if (s < bounds.start) { e += bounds.start - s; s = bounds.start; }
+    if (e > bounds.end) { s -= e - bounds.end; e = bounds.end; }
+    return { start: Math.round(Math.max(bounds.start, s)), end: Math.round(Math.min(bounds.end, e)) };
+  }
+  var tip = null;
+  function showTip(el, text) {
+    if (!tip) {
+      tip = doc.createElement("div");
+      tip.className = "chart-tooltip"; tip.setAttribute("role", "status"); tip.setAttribute("aria-live", "polite");
+      doc.body.appendChild(tip);
+    }
+    tip.textContent = text; tip.classList.add("visible");
+    var r = el.getBoundingClientRect();
+    tip.style.left = Math.max(4, Math.min(r.left, window.innerWidth - 20 - tip.offsetWidth)) + "px";
+    tip.style.top = (r.bottom + 6) + "px";
+  }
+  function hideTip() { if (tip) tip.classList.remove("visible"); }
+
+  function initChart(svg) {
+    var id = svg.id, W = Number(svg.getAttribute("data-width")) || 800, unit = svg.getAttribute("data-unit") || "MHz";
+    var decimals = Number(svg.getAttribute("data-axis-decimals")) || 0, minSpan = Number(svg.getAttribute("data-min-span")) || 1;
+    var axisY = Number(svg.getAttribute("data-axis-y")), spotY = Number(svg.getAttribute("data-spot-y"));
+    var bounds = { start: Number(svg.getAttribute("data-domain-start")), end: Number(svg.getAttribute("data-domain-end")) };
+    if (!id || !(bounds.end > bounds.start)) return;
+    var cur = { start: bounds.start, end: bounds.end };
+    function fx(hz) { return (hz - cur.start) / (cur.end - cur.start) * W; }
+    var controls = doc.querySelector('[data-chart-controls="' + id + '"]');
+    var rangeEl = doc.querySelector('[data-chart-range="' + id + '"]');
+    var filterBox = doc.querySelector('[data-class-filter-group="' + id + '"]');
+
+    /* keyboard reachable segments with a tooltip taken from their <title> */
+    Array.prototype.forEach.call(svg.querySelectorAll("rect.seg, polygon.spot-marker"), function (el) {
+      var t = el.querySelector("title"), text = t ? t.textContent : "";
+      el.setAttribute("tabindex", "0");
+      if (!text) return;
+      el.addEventListener("mouseenter", function () { showTip(el, text); });
+      el.addEventListener("mouseleave", hideTip);
+      el.addEventListener("focus", function () { showTip(el, text); });
+      el.addEventListener("blur", hideTip);
+      el.addEventListener("keydown", function (ev) { if (ev.key === "Escape") hideTip(); });
+    });
+
+    function redraw() {
+      svg.setAttribute("data-view-start", String(cur.start));
+      svg.setAttribute("data-view-end", String(cur.end));
+      svg.classList.toggle("zoomed", cur.start > bounds.start || cur.end < bounds.end);
+      Array.prototype.forEach.call(svg.querySelectorAll("rect[data-start]"), function (el) {
+        var a = Number(el.getAttribute("data-start")), b = Number(el.getAttribute("data-end"));
+        if (b < cur.start || a > cur.end) { el.style.display = "none"; return; }
+        el.style.display = "";
+        var x = fx(Math.max(a, cur.start));
+        el.setAttribute("x", String(x));
+        el.setAttribute("width", String(Math.max(0, fx(Math.min(b, cur.end)) - x)));
+      });
+      Array.prototype.forEach.call(svg.querySelectorAll("text.seg-label[data-start]"), function (el) {
+        var a = Number(el.getAttribute("data-start")), b = Number(el.getAttribute("data-end"));
+        var x1 = fx(Math.max(a, cur.start)), x2 = fx(Math.min(b, cur.end));
+        var show = b >= cur.start && a <= cur.end && x2 - x1 > Number(el.getAttribute("data-min-w") || 0);
+        el.style.display = show ? "" : "none";
+        if (show) el.setAttribute("x", String((x1 + x2) / 2));
+      });
+      Array.prototype.forEach.call(svg.querySelectorAll("polygon[data-freq]"), function (el) {
+        var hz = Number(el.getAttribute("data-freq")), ok = hz >= cur.start && hz <= cur.end;
+        el.style.display = ok ? "" : "none";
+        if (ok) { var x = fx(hz); el.setAttribute("points", (x - 4) + "," + (spotY + 6) + " " + (x + 4) + "," + (spotY + 6) + " " + x + "," + (spotY - 2)); }
+      });
+      var axis = svg.querySelector("g.axis");
+      if (axis) {
+        Array.prototype.forEach.call(axis.querySelectorAll("g.tick"), function (n) { axis.removeChild(n); });
+        var ticks = genTicks(cur, 6);
+        ticks.forEach(function (hz, i) {
+          var x = fx(hz), g = doc.createElementNS(SVGNS, "g"), ln = doc.createElementNS(SVGNS, "line"), tx = doc.createElementNS(SVGNS, "text");
+          g.setAttribute("class", "tick"); g.setAttribute("data-hz", String(hz));
+          ln.setAttribute("x1", String(x)); ln.setAttribute("y1", String(axisY)); ln.setAttribute("x2", String(x)); ln.setAttribute("y2", String(axisY + 5));
+          tx.setAttribute("x", String(x)); tx.setAttribute("y", String(axisY + 16));
+          tx.setAttribute("text-anchor", i === 0 ? "start" : i === ticks.length - 1 ? "end" : "middle");
+          tx.textContent = fmtHz(hz, unit, decimals);
+          g.appendChild(ln); g.appendChild(tx); axis.appendChild(g);
+        });
+      }
+      if (rangeEl) rangeEl.textContent = fmtHz(cur.start, unit, decimals) + "–" + fmtHz(cur.end, unit, decimals) + " " + unit;
+    }
+    function setView(d) { cur = clampDomain(d, bounds, minSpan); redraw(); }
+    function zoom(f) {
+      var m = (cur.start + cur.end) / 2, half = (cur.end - cur.start) * f / 2;
+      setView({ start: m - half, end: m + half });
+    }
+    function pan(frac) { var d = (cur.end - cur.start) * frac; setView({ start: cur.start + d, end: cur.end + d }); }
+    function act(a) {
+      if (a === "in") zoom(0.5); else if (a === "out") zoom(2);
+      else if (a === "reset") setView({ start: bounds.start, end: bounds.end });
+      else if (a === "left") pan(-0.25); else if (a === "right") pan(0.25);
+    }
+    if (controls) {
+      controls.hidden = false;
+      Array.prototype.forEach.call(controls.querySelectorAll("[data-zoom]"), function (b) {
+        b.addEventListener("click", function () { act(b.getAttribute("data-zoom")); });
+      });
+      if (rangeEl) redraw();
+    }
+    /* mouse / pen drag pans a zoomed chart; touch users scroll the chart or use the buttons */
+    var drag = null;
+    svg.addEventListener("pointerdown", function (ev) {
+      if (ev.pointerType === "touch" || ev.button !== 0 || !svg.classList.contains("zoomed")) return;
+      drag = { x: ev.clientX, s: cur.start, e: cur.end };
+      svg.classList.add("dragging");
+      if (svg.setPointerCapture) { try { svg.setPointerCapture(ev.pointerId); } catch (err) {} }
+    });
+    svg.addEventListener("pointermove", function (ev) {
+      if (!drag) return;
+      var wpx = svg.getBoundingClientRect().width || W, d = -(ev.clientX - drag.x) / wpx * (drag.e - drag.s);
+      setView({ start: drag.s + d, end: drag.e + d });
+    });
+    function endDrag() { drag = null; svg.classList.remove("dragging"); }
+    svg.addEventListener("pointerup", endDrag);
+    svg.addEventListener("pointercancel", endDrag);
+    /* keyboard on a focused segment: + / - zoom, arrows pan, 0 resets */
+    svg.addEventListener("keydown", function (ev) {
+      if (ev.ctrlKey || ev.altKey || ev.metaKey) return;
+      var map = { "+": "in", "=": "in", "-": "out", "_": "out", "0": "reset", "ArrowLeft": "left", "ArrowRight": "right" };
+      if (map[ev.key]) { ev.preventDefault(); act(map[ev.key]); }
+    });
+
+    /* licence-class filter: dims what the selected class may not use; classes with a narrowed sub-range also dim
+       the plain allocation bar */
+    if (filterBox) {
+      filterBox.hidden = false;
+      var buttons = filterBox.querySelectorAll("[data-class-filter]");
+      Array.prototype.forEach.call(buttons, function (btn) {
+        btn.addEventListener("click", function () {
+          var sel = btn.getAttribute("data-class-filter"), all = sel === "ALL";
+          Array.prototype.forEach.call(buttons, function (b) { b.setAttribute("aria-pressed", String(b === btn)); });
+          Array.prototype.forEach.call(svg.querySelectorAll(".class-seg"), function (el) {
+            el.parentNode.classList.toggle("class-dimmed", !all && el.getAttribute("data-class") !== sel);
+          });
+          Array.prototype.forEach.call(svg.querySelectorAll(".tr-seg"), function (el) {
+            el.parentNode.classList.toggle("class-dimmed", !all && btn.hasAttribute("data-has-narrow"));
+          });
+          Array.prototype.forEach.call(doc.querySelectorAll(".class-access-list li[data-class]"), function (li) {
+            li.classList.toggle("class-dimmed-item", !all && li.getAttribute("data-class") !== sel);
+          });
+        });
+      });
+    }
+  }
+  Array.prototype.forEach.call(doc.querySelectorAll("svg.spectrum[data-domain-start][id]"), initChart);
 })();
