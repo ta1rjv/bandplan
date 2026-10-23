@@ -38,7 +38,9 @@
   /* open tree branches leading to a #target */
   function revealTarget() {
     if (!location.hash) return;
-    var el = doc.getElementById(decodeURIComponent(location.hash.slice(1)));
+    var id = location.hash.slice(1);
+    try { id = decodeURIComponent(id); } catch (err) { /* malformed escape: use the raw fragment */ }
+    var el = doc.getElementById(id);
     while (el) { if (el.tagName === "DETAILS") el.open = true; el = el.parentElement; }
   }
   revealTarget();
@@ -103,12 +105,17 @@
     return String(s).replace(/[&<>"']/g, function (c) { return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]; });
   }
   function highlight(text, q) {
-    var html = escapeHtml(text);
-    terms(q).forEach(function (t) {
-      var et = escapeHtml(t).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-      html = html.replace(new RegExp("(" + et + ")", "ig"), "<mark>$1</mark>");
-    });
-    return html;
+    /* match on the raw text, escape every piece separately (entities are never split) */
+    text = String(text);
+    var ts = terms(q).filter(Boolean).map(function (t) { return t.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"); });
+    if (!ts.length) return escapeHtml(text);
+    var re = new RegExp("(" + ts.join("|") + ")", "ig"), out = "", last = 0, m;
+    while ((m = re.exec(text)) !== null) {
+      if (!m[0]) { re.lastIndex++; continue; }
+      out += escapeHtml(text.slice(last, m.index)) + "<mark>" + escapeHtml(m[0]) + "</mark>";
+      last = m.index + m[0].length;
+    }
+    return out + escapeHtml(text.slice(last));
   }
   function snippet(e, q) {
     var x = e.x || "", ts = terms(q), pos = -1;
@@ -279,7 +286,7 @@
           g.appendChild(ln); g.appendChild(tx); axis.appendChild(g);
         });
       }
-      if (rangeEl) rangeEl.textContent = fmtHz(cur.start, unit, decimals) + "–" + fmtHz(cur.end, unit, decimals) + " " + unit;
+      if (rangeEl) rangeEl.textContent = fmtHz(cur.start, unit, decimals) + "\u2013" + fmtHz(cur.end, unit, decimals) + " " + unit;
     }
     function setView(d) { cur = clampDomain(d, bounds, minSpan); redraw(); }
     function zoom(f) {
